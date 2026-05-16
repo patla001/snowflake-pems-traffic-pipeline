@@ -1,70 +1,82 @@
 -- ============================================================
--- 01_setup.sql — Snowflake Job Prospecting Capstone
--- Data engineering fundamentals: schemas, warehouse, stages for big data
--- Run this first in your Snowflake account
+-- 01_setup.sql — Snowflake setup for Caltrans PeMS Traffic Capstone
+-- Warehouse, database, schemas, file format, and stage for PeMS CSV files
 -- ============================================================
 --
--- IMPORTANT: Run the ENTIRE script (select all → Run / Run All).
--- Running only the warehouse block leaves JOB_PROSPECTING_DB missing.
--- If CREATE DATABASE fails, use a role with that privilege (trial: USE ROLE ACCOUNTADMIN;).
+-- IMPORTANT: Run the ENTIRE script (select all → Run All).
+-- Running only the warehouse block leaves TRAFFIC_PEMS_DB missing.
+-- If CREATE DATABASE fails with "not authorized", use a role that can create
+-- databases — trial accounts: USE ROLE ACCOUNTADMIN;
 --
--- Role tip: Objects created as ACCOUNTADMIN are NOT automatically visible to SYSADMIN.
--- If 02_staging.sql says "not authorized" after a successful 01, run 01 again as ACCOUNTADMIN
--- (the GRANT block below fixes that), OR run all scripts as ACCOUNTADMIN, OR set your
--- Airflow Snowflake connection to use the same role you used for CREATE DATABASE.
---
--- If CREATE DATABASE fails with "not authorized", your worksheet role cannot create
--- databases — use a role that can (often ACCOUNTADMIN on trial), or ask for USAGE on
--- an existing shared database and change object names in this repo to match.
+-- Role tip: Objects created as ACCOUNTADMIN are NOT automatically visible to
+-- SYSADMIN. The GRANT block at the end shares this DB/warehouse with SYSADMIN
+-- so the Airflow Snowflake connection (or your worksheet default role) can
+-- still see it. If you set the Airflow conn role to ACCOUNTADMIN, the grants
+-- are redundant but harmless.
 -- ============================================================
 
 USE ROLE ACCOUNTADMIN;
 
--- 1) Database and schemas first (no warehouse required for this DDL)
-CREATE DATABASE IF NOT EXISTS JOB_PROSPECTING_DB
-  COMMENT = 'Job prospecting capstone - dimensional model + SCD2';
+-- 1) Database and schemas
+CREATE DATABASE IF NOT EXISTS TRAFFIC_PEMS_DB
+  COMMENT = 'Caltrans PeMS traffic delay/wait-time analytics — dimensional model + SCD2';
 
-CREATE SCHEMA IF NOT EXISTS JOB_PROSPECTING_DB.RAW
-  COMMENT = 'Denormalized teaching tables (jobs, skills) for 02_tables.sql / 03_sample_data.sql';
+CREATE SCHEMA IF NOT EXISTS TRAFFIC_PEMS_DB.STAGING
+  COMMENT = 'Landing zone for PeMS hourly station data and station inventory CSVs';
 
-CREATE SCHEMA IF NOT EXISTS JOB_PROSPECTING_DB.STAGING
-  COMMENT = 'Landing zone for raw job data; batch and incremental loads';
+CREATE SCHEMA IF NOT EXISTS TRAFFIC_PEMS_DB.EDW
+  COMMENT = 'Enterprise data warehouse — star schema with SCD Type 2 dim_station';
 
-CREATE SCHEMA IF NOT EXISTS JOB_PROSPECTING_DB.EDW
-  COMMENT = 'Enterprise data warehouse - star schema, SCD Type 2 dimensions';
+CREATE SCHEMA IF NOT EXISTS TRAFFIC_PEMS_DB.ANALYTICS
+  COMMENT = 'Curated views for Tableau and ad-hoc analytics';
 
-CREATE SCHEMA IF NOT EXISTS JOB_PROSPECTING_DB.ANALYTICS
-  COMMENT = 'Analytics views for job prospecting';
-
--- 2) Warehouse (OK if it already exists)
-CREATE WAREHOUSE IF NOT EXISTS JOB_PROSPECTING_WH
+-- 2) Warehouse — auto-suspend keeps costs low between loads
+-- Note: hourly statewide × 3 years is ~1B rows. Consider scaling to SMALL or
+-- MEDIUM temporarily during the initial historical load, then back to X-SMALL.
+CREATE WAREHOUSE IF NOT EXISTS TRAFFIC_PEMS_WH
   WITH
   WAREHOUSE_SIZE = 'X-SMALL'
   AUTO_SUSPEND = 300
   AUTO_RESUME = TRUE
   INITIALLY_SUSPENDED = TRUE
   SCALING_POLICY = 'STANDARD'
-  COMMENT = 'Warehouse for job prospecting; scale up for large batch loads';
+  COMMENT = 'Warehouse for PeMS pipeline; scale up for historical backfills';
 
--- 3) File format and stage (depend on STAGING schema)
-CREATE FILE FORMAT IF NOT EXISTS JOB_PROSPECTING_DB.STAGING.FF_CSV_JOBS
+-- 3) File format and stage — PeMS Data Clearinghouse exports are gzipped CSV
+-- with no header (the docs describe positional columns). Adjust SKIP_HEADER if
+-- your downloads include the column row.
+CREATE FILE FORMAT IF NOT EXISTS TRAFFIC_PEMS_DB.STAGING.FF_CSV_PEMS
   TYPE = 'CSV'
   FIELD_OPTIONALLY_ENCLOSED_BY = '"'
-  SKIP_HEADER = 1
-  NULL_IF = ('NULL', '')
+  SKIP_HEADER = 0
+  NULL_IF = ('', 'NULL', 'null')
   COMPRESSION = 'AUTO'
-  COMMENT = 'CSV format for job posting files';
+  EMPTY_FIELD_AS_NULL = TRUE
+  COMMENT = 'CSV format for PeMS Data Clearinghouse exports (gzipped, no header)';
 
-CREATE STAGE IF NOT EXISTS JOB_PROSPECTING_DB.STAGING.STG_JOBS_FILES
-  FILE_FORMAT = (FORMAT_NAME = 'JOB_PROSPECTING_DB.STAGING.FF_CSV_JOBS')
-  COMMENT = 'Stage for job posting CSV/JSON files - used by pipeline';
+CREATE OR REPLACE FILE FORMAT TRAFFIC_PEMS_DB.STAGING.FF_CSV_PEMS_META
+  TYPE = 'CSV'
+  FIELD_DELIMITER = '\t'
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+  SKIP_HEADER = 1
+  NULL_IF = ('', 'NULL', 'null')
+  COMPRESSION = 'AUTO'
+  EMPTY_FIELD_AS_NULL = TRUE
+  COMMENT = 'TAB-delimited format for PeMS Station Metadata exports (header row present, 18 columns)';
 
--- 4) Let SYSADMIN use this database (worksheets / roles often default to SYSADMIN after setup)
-GRANT USAGE ON DATABASE JOB_PROSPECTING_DB TO ROLE SYSADMIN;
-GRANT ALL ON ALL SCHEMAS IN DATABASE JOB_PROSPECTING_DB TO ROLE SYSADMIN;
-GRANT USAGE ON WAREHOUSE JOB_PROSPECTING_WH TO ROLE SYSADMIN;
+CREATE STAGE IF NOT EXISTS TRAFFIC_PEMS_DB.STAGING.STG_PEMS_FILES
+  FILE_FORMAT = (FORMAT_NAME = 'TRAFFIC_PEMS_DB.STAGING.FF_CSV_PEMS')
+  COMMENT = 'Stage for PeMS hourly station data files (one folder per district/year recommended)';
 
-USE DATABASE JOB_PROSPECTING_DB;
+CREATE STAGE IF NOT EXISTS TRAFFIC_PEMS_DB.STAGING.STG_PEMS_META_FILES
+  FILE_FORMAT = (FORMAT_NAME = 'TRAFFIC_PEMS_DB.STAGING.FF_CSV_PEMS_META')
+  COMMENT = 'Stage for PeMS station inventory / metadata files';
 
--- Sanity check: you should see JOB_PROSPECTING_DB listed
-SHOW DATABASES LIKE 'JOB_PROSPECTING_DB';
+-- 4) Share access with SYSADMIN (worksheets often default to SYSADMIN)
+GRANT USAGE ON DATABASE TRAFFIC_PEMS_DB TO ROLE SYSADMIN;
+GRANT ALL ON ALL SCHEMAS IN DATABASE TRAFFIC_PEMS_DB TO ROLE SYSADMIN;
+GRANT USAGE ON WAREHOUSE TRAFFIC_PEMS_WH TO ROLE SYSADMIN;
+
+USE DATABASE TRAFFIC_PEMS_DB;
+
+SHOW DATABASES LIKE 'TRAFFIC_PEMS_DB';

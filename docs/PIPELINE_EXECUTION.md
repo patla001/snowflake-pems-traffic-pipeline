@@ -1,258 +1,209 @@
-# Pipeline Execution Guide — Job Prospecting on Snowflake
+# Pipeline Execution Guide — Caltrans PeMS Traffic Analytics
 
-This document explains how to run the job prospecting pipeline in **Snowflake** (manually or via scripts) and how to orchestrate it with **Apache Airflow**.
+How to register for Caltrans PeMS, load Station Hour exports into Snowflake, and run the pipeline either manually or via Apache Airflow.
 
 ---
 
-## Table of Contents
+## Table of contents
 
 1. [Prerequisites](#prerequisites)
-2. [Executing the Pipeline in Snowflake (Manual)](#executing-the-pipeline-in-snowflake-manual)
-3. [Executing with Apache Airflow](#executing-with-apache-airflow)
-4. [Troubleshooting](#troubleshooting)
+2. [Register for Caltrans PeMS](#register-for-caltrans-pems)
+3. [Download Station Hour data](#download-station-hour-data)
+4. [Upload files to the Snowflake stage](#upload-files-to-the-snowflake-stage)
+5. [Execute the pipeline manually](#execute-the-pipeline-manually)
+6. [Execute with Apache Airflow](#execute-with-apache-airflow)
+7. [Connect Tableau](#connect-tableau)
+8. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Prerequisites
 
-- **Snowflake account** (trial: [signup.snowflake.com](https://signup.snowflake.com))
-- **Snowflake UI** (Worksheets) or **SnowSQL** CLI
-- For Airflow: **Python 3.9+**, **Apache Airflow 3.x**, and **Snowflake Airflow provider** (DAG uses `airflow.sdk` — see [Upgrading to Airflow 3](https://airflow.apache.org/docs/apache-airflow/3.2.0/installation/upgrading_to_airflow3.html))
+- **Caltrans PeMS account** — `pems.dot.ca.gov` (free; manually approved by Caltrans, typically 1–3 business days)
+- **Snowflake account** — trial is fine: `signup.snowflake.com`
+- **Airflow 3.x + Snowflake provider** — see project `requirements*.txt`
+- (Optional) **Tableau Desktop** with the Snowflake connector
 
 ---
 
-## Executing the Pipeline in Snowflake (Manual)
+## Register for Caltrans PeMS
 
-Run the following in order. Use **Snowflake Worksheets** (web UI) or **SnowSQL** and execute each script in sequence.
+1. Go to `https://pems.dot.ca.gov`.
+2. Click **Register** (top-right). Fill in name, affiliation (SDSU is fine), and a brief use case ("academic capstone — traffic delay analytics").
+3. Caltrans emails account approval within a few business days. **Plan around this lead time.**
+4. After approval, sign in and confirm you can see the **Data Clearinghouse** tab in the top nav.
 
-### Phase 1: One-time setup
+---
 
-Run once per environment (or when adding new objects).
+## Download Station Hour data
 
-| Order | Script | Description |
-|-------|--------|-------------|
-| 1 | `sql/01_setup.sql` | Warehouse, database, schemas (STAGING, EDW, ANALYTICS), file format, stage |
-| 2 | `sql/02_staging.sql` | Staging tables: `stg_jobs_raw`, `stg_jobs_deduped` |
-| 3 | `sql/02_dimensions_scd2.sql` | Dimension tables with SCD2: `dim_company`, `dim_skill`, `dim_location`, `dim_source`, `dim_date` (empty shell) |
-| 4 | `sql/03_seed_dim_date.sql` | **Populate `dim_date`** (calendar 2018–2035 + sentinel `19000101`) so `posted_date_sk` matches real dates in reports |
-| 5 | `sql/02_fact.sql` | Fact table `fact_job_posting` and bridge `fact_job_skill` |
+1. **Data Clearinghouse → Type = "Station Hour" → District = (all 12 or one at a time)**.
+2. Pick a year/month. Each file is a gzipped CSV like `d04_text_station_hour_2024_01.txt.gz`.
+3. Download all months 2022 → 2024 (statewide × hourly × 3 years ≈ ~430 files, ~40 GB compressed). Recommend scripting the downloads — Caltrans does not offer a bulk button.
+4. Also grab **Type = "Meta" → Station Metadata** for the same districts: `d04_text_meta_2024_01_06.txt`. This is the SCD source for `dim_station`.
 
-Run **`03_seed_dim_date.sql` once** after dimensions exist and **before** (or anytime before) heavy fact reporting; re-run is safe (MERGE is idempotent).
+> **Tip:** Start with a single district-month (e.g. D11 January 2024) to validate end-to-end before pulling the full statewide history.
 
-### Phase 2: Load data into staging
+---
 
-Choose one of the following.
+## Upload files to the Snowflake stage
 
-**Option A: COPY INTO from stage (big data)**
+After running `sql/01_setup.sql` to create `@TRAFFIC_PEMS_DB.STAGING.STG_PEMS_FILES`:
 
-1. Upload your CSV/JSON files to the Snowflake stage:
-   - In Snowflake: **Databases → JOB_PROSPECTING_DB → STAGING → Stages → STG_JOBS_FILES**
-   - Use **Upload** or put files there via SnowSQL/Snowflake CLI.
+**Option A — Snowsight UI:** Databases → `TRAFFIC_PEMS_DB` → `STAGING` → Stages → `STG_PEMS_FILES` → **Upload**. Good for ad-hoc testing.
 
-2. Set a **batch ID** for this run (e.g. UUID or timestamp):
-
-   ```sql
-   SET batch_id = (SELECT UUID_STRING());
-   -- Or: SET batch_id = TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISS');
-   ```
-
-3. Run a `COPY INTO` that matches your file layout. Example for a 14-column CSV (adjust column mapping to your file):
-
-   ```sql
-   USE DATABASE JOB_PROSPECTING_DB;
-   USE SCHEMA STAGING;
-
-   COPY INTO stg_jobs_raw (
-     ingest_batch_id,
-     file_name,
-     row_number,
-     source_system,
-     external_job_id,
-     title,
-     company_name,
-     location_raw,
-     location_type,
-     salary_min,
-     salary_max,
-     salary_currency,
-     job_url,
-     posted_date,
-     skills_raw
-   )
-   FROM (
-     SELECT
-       $batch_id,
-       METADATA$FILENAME,
-       METADATA$FILE_ROW_NUMBER,
-       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
-     FROM @STG_JOBS_FILES
-   )
-   FILE_FORMAT = (FORMAT_NAME = 'JOB_PROSPECTING_DB.STAGING.FF_CSV_JOBS')
-   ON_ERROR = 'CONTINUE';
-   ```
-
-**Option B: Insert test data directly**
-
-Run `sql/03_sample_data.sql` if it inserts into `stg_jobs_raw` or `stg_jobs_deduped`, and use the same `batch_id` value in the steps below where required.
-
-### Phase 3: Run the pipeline (staging → EDW)
-
-Use a **single batch ID** for the whole run (same value used in Phase 2, or a new one if you only populated `stg_jobs_deduped` directly).
-
-1. **Merge staging into deduped table** (if you used Option A and copied into `stg_jobs_raw`):
-
-   ```sql
-   CALL JOB_PROSPECTING_DB.STAGING.merge_staging_deduped('<your_batch_id>');
-   ```
-
-   Replace `<your_batch_id>` with the value of `batch_id` from Phase 2 (e.g. from `SELECT $batch_id;`).
-
-2. **SCD2 and dimension merges:**
-
-   ```sql
-   CALL JOB_PROSPECTING_DB.EDW.merge_dim_company_scd2();
-   CALL JOB_PROSPECTING_DB.EDW.merge_dim_location_scd2();
-   CALL JOB_PROSPECTING_DB.EDW.merge_dim_source();
-   CALL JOB_PROSPECTING_DB.EDW.merge_dim_skill_scd2();   -- optional; no-op if no skill parsing
-   ```
-
-3. **Load fact table:**
-
-   ```sql
-   CALL JOB_PROSPECTING_DB.EDW.load_fact_job_posting('<your_batch_id>');
-   ```
-
-4. **(Optional) Close outdated fact rows** (if you support SCD on the fact):
-
-   ```sql
-   CALL JOB_PROSPECTING_DB.EDW.close_outdated_fact_rows('<your_batch_id>');
-   ```
-
-### Summary: execution order (manual)
-
+**Option B — Snowflake CLI / SnowSQL (recommended for bulk):**
+```bash
+snow stage copy ./pems_downloads/ @TRAFFIC_PEMS_DB.STAGING.STG_PEMS_FILES --recursive
+# Or with snowsql:
+PUT file://pems_downloads/*.gz @TRAFFIC_PEMS_DB.STAGING.STG_PEMS_FILES AUTO_COMPRESS=FALSE PARALLEL=8;
 ```
-01_setup.sql → 02_staging.sql → 02_dimensions_scd2.sql → 03_seed_dim_date.sql → 02_fact.sql
-    → Load data (COPY INTO or 03_sample_data)
-    → CALL JOB_PROSPECTING_DB.STAGING.merge_staging_deduped(batch_id)
-    → CALL JOB_PROSPECTING_DB.EDW.merge_dim_company_scd2();
-    → CALL JOB_PROSPECTING_DB.EDW.merge_dim_location_scd2();
-    → CALL JOB_PROSPECTING_DB.EDW.merge_dim_source();
-    → CALL JOB_PROSPECTING_DB.EDW.load_fact_job_posting(batch_id);
+
+Station metadata files go to `@TRAFFIC_PEMS_DB.STAGING.STG_PEMS_META_FILES` (header row format).
+
+---
+
+## Execute the pipeline manually
+
+### Phase 1 — One-time setup (per environment)
+
+Run in this order in Snowsight or SnowSQL. All scripts are idempotent.
+
+| # | Script | Description |
+|---|--------|-------------|
+| 1 | `sql/01_setup.sql` | Database, schemas, warehouse, file formats, stages |
+| 2 | `sql/02_staging.sql` | Staging tables (`stg_pems_hour_raw/deduped`, `stg_pems_station_meta_raw`) |
+| 3 | `sql/02_dimensions_scd2.sql` | Dimensions (SCD2 `dim_station` + `dim_freeway`, `dim_district`, `dim_time_of_day`, `dim_holiday`, `dim_date`) |
+| 4 | `sql/02_fact.sql` | `fact_traffic_hour` + `agg_traffic_daily` rollup |
+| 5 | `sql/03_seed_dim_date.sql` | Calendar 2018–2030 + sentinel |
+| 6 | `sql/03_seed_dim_time_of_day.sql` | 24 rows, peak periods |
+| 7 | `sql/03_seed_dim_district.sql` | 12 Caltrans districts |
+| 8 | `sql/03_seed_dim_holiday.sql` | Federal + CA holidays 2022–2026 |
+| 9 | `sql/03_pipeline_ingest.sql` | `STAGING.merge_pems_staging_deduped(batch_id)` |
+| 10 | `sql/03_pipeline_scd2_merge.sql` | `EDW.merge_dim_station_scd2()`, `merge_dim_freeway()`, stubs |
+| 11 | `sql/03_pipeline_fact_load.sql` | `EDW.load_fact_traffic_hour(batch_id)`, `refresh_agg_traffic_daily(batch_id)` |
+| 12 | `sql/04_views.sql` | Tableau analytics views |
+
+### Phase 2 — Ingest a batch
+
+```sql
+USE DATABASE TRAFFIC_PEMS_DB;
+USE WAREHOUSE TRAFFIC_PEMS_WH;
+SET batch_id = TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISS');
+
+COPY INTO TRAFFIC_PEMS_DB.STAGING.stg_pems_hour_raw (
+  ingest_batch_id, file_name, file_row_number,
+  station_id, sample_datetime, district, freeway, direction_of_travel,
+  lane_type, station_length_mi, samples, pct_observed,
+  total_flow_veh, avg_occupancy, avg_speed_mph
+)
+FROM (
+  SELECT
+    $batch_id,
+    METADATA$FILENAME,
+    METADATA$FILE_ROW_NUMBER,
+    $2::INTEGER,
+    TO_TIMESTAMP_NTZ($1, 'MM/DD/YYYY HH24:MI:SS'),
+    $3::SMALLINT, $4::SMALLINT, $5::VARCHAR, $6::VARCHAR,
+    $7::NUMBER(6,3), $8::INTEGER, $9::NUMBER(5,2),
+    $10::NUMBER(10,2), $11::NUMBER(8,6), $12::NUMBER(6,2)
+  FROM @TRAFFIC_PEMS_DB.STAGING.STG_PEMS_FILES
+)
+FILE_FORMAT = (FORMAT_NAME = 'TRAFFIC_PEMS_DB.STAGING.FF_CSV_PEMS')
+ON_ERROR = 'CONTINUE';
+```
+
+### Phase 3 — Transform → fact → rollup
+
+```sql
+CALL TRAFFIC_PEMS_DB.STAGING.merge_pems_staging_deduped($batch_id);
+CALL TRAFFIC_PEMS_DB.EDW.merge_dim_station_scd2();
+CALL TRAFFIC_PEMS_DB.EDW.merge_dim_freeway();
+CALL TRAFFIC_PEMS_DB.EDW.load_fact_traffic_hour($batch_id);
+CALL TRAFFIC_PEMS_DB.EDW.refresh_agg_traffic_daily($batch_id);
+```
+
+### Phase 4 — Verify
+
+```sql
+SELECT COUNT(*) AS hourly_rows FROM TRAFFIC_PEMS_DB.EDW.fact_traffic_hour;
+SELECT COUNT(*) AS daily_rows  FROM TRAFFIC_PEMS_DB.EDW.agg_traffic_daily;
+SELECT * FROM TRAFFIC_PEMS_DB.ANALYTICS.v_district_summary LIMIT 20;
 ```
 
 ---
 
-## Executing with Apache Airflow
+## Execute with Apache Airflow
 
-Airflow runs the same pipeline in order and passes a **batch ID** (e.g. from the DAG run) to the procedures that need it.
+The DAG `dags/pems_traffic_pipeline_dag.py` runs the same procedures in order, threading a unique `batch_id` from the DAG run.
 
-### 1. Install Airflow and Snowflake provider
+### 1. Configure the Snowflake connection
 
-From the project root:
-
-```bash
-pip install "apache-airflow>=2.5.0" "apache-airflow-providers-snowflake>=5.0.0"
+Either set `AIRFLOW_CONN_SNOWFLAKE_DEFAULT` in `.env` (see `.env.example`):
 ```
-
-Or use the project’s Airflow requirements file if present:
-
-```bash
-pip install -r requirements-airflow.txt
+AIRFLOW_CONN_SNOWFLAKE_DEFAULT=snowflake://USER:PASSWORD@/?account=<id>&warehouse=TRAFFIC_PEMS_WH&database=TRAFFIC_PEMS_DB&role=ACCOUNTADMIN
 ```
+…or use the Airflow UI: **Admin → Connections → snowflake_default**, with extra `{"database": "TRAFFIC_PEMS_DB", "warehouse": "TRAFFIC_PEMS_WH", "role": "ACCOUNTADMIN"}`.
 
-### 2. Configure Snowflake connection in Airflow
+### 2. Optional variables
 
-1. Open Airflow UI → **Admin → Connections**.
-2. Add a new connection:
-   - **Connection Id:** `snowflake_default` (or the ID used in the DAG).
-   - **Connection Type:** `Snowflake`.
-   - **Host:** `.<account_identifier>.snowflakecomputing.com` (e.g. `xy12345.us-east-1`).
-   - **Login:** your Snowflake username.
-   - **Password:** your Snowflake password.
-   - **Schema:** `JOB_PROSPECTING_DB` (or leave blank and set in DAG/operator).
-   - **Extra (JSON):**  
-     `{"database": "JOB_PROSPECTING_DB", "warehouse": "JOB_PROSPECTING_WH", "role": "ACCOUNTADMIN"}`  
-     Adjust `database`, `warehouse`, and `role` to your environment.
+- `traffic_pems_database` (default `TRAFFIC_PEMS_DB`)
+- `traffic_pems_schema_staging` (default `STAGING`)
+- `traffic_pems_schema_edw` (default `EDW`)
+- `traffic_pems_stage` (default `STG_PEMS_FILES`)
 
-### 3. DAG location and schedule
+### 3. Run
 
-- Place the DAG file in your Airflow **DAGs folder** (e.g. `~/airflow/dags/` or the path set in `airflow.cfg`).
-- The project’s DAG file is: **`dags/job_prospecting_pipeline_dag.py`** (repo root — used by **Astronomer** and this repo’s `docker-compose`).  
-  For a classic Airflow install, copy that file into your DAGs directory so Airflow can load it.
+1. Start Airflow (`docker compose up -d` or `astro dev start`).
+2. Open `http://localhost:8080`, find **pems_traffic_pipeline**, unpause, trigger.
+3. The DAG runs: `get_batch_id → setup → copy_pems_to_staging → merge_staging_deduped → scd2_dim_station → merge_dim_freeway → load_fact_traffic_hour → refresh_agg_traffic_daily`.
 
-### 4. Seed `dim_date` (recommended once per environment)
+### 4. What the DAG expects
 
-Run **`sql/03_seed_dim_date.sql`** in Snowflake after dimension DDL exists so `fact_job_posting.posted_date_sk` resolves to real calendar keys (not only the `19000101` fallback).
+- Files already uploaded to `@STG_PEMS_FILES` (the DAG does not download from PeMS).
+- Procedures from `sql/03_pipeline_*.sql` already created in Snowflake (run those once per environment).
+- Dimension seeds (`03_seed_dim_*.sql`) already run.
 
-### 5. Deploy Snowflake procedures (required before first DAG run)
+---
 
-The DAG calls stored procedures in Snowflake. Create them once by running these scripts in Snowflake (in order):
+## Connect Tableau
 
-- `sql/03_pipeline_ingest.sql` — creates `JOB_PROSPECTING_DB.STAGING.merge_staging_deduped(batch_id)`
-- `sql/03_pipeline_scd2_merge.sql` — creates `JOB_PROSPECTING_DB.EDW.merge_dim_company_scd2()`, `merge_dim_location_scd2()`, `merge_dim_source()`, `merge_dim_skill_scd2()`
-- `sql/03_pipeline_fact_load.sql` — creates `JOB_PROSPECTING_DB.EDW.load_fact_job_posting(batch_id)`, `close_outdated_fact_rows(batch_id)`
-
-After that, the Airflow DAG can run without re-running these scripts.
-
-### 6. What the DAG does
-
-The DAG defines tasks that:
-
-1. **Setup (optional):** Run `01_setup.sql` (idempotent; safe to run every time or only on first deploy).
-2. **Create objects:** Run `02_staging.sql`, `02_dimensions_scd2.sql`, `02_fact.sql` (idempotent). In Snowflake, also run **`03_seed_dim_date.sql`** once so `dim_date` is populated for reporting.
-3. **Ingest:** Run a SQL statement that either:
-   - Runs `COPY INTO` from the stage (requires files in `@STG_JOBS_FILES`), or
-   - Inserts a small set of test rows into `stg_jobs_raw` with the run’s batch ID.
-4. **Merge staging:** `CALL JOB_PROSPECTING_DB.STAGING.merge_staging_deduped(batch_id)`.
-5. **SCD2 and dimensions:**  
-   `CALL JOB_PROSPECTING_DB.EDW.merge_dim_company_scd2();`  
-   `CALL JOB_PROSPECTING_DB.EDW.merge_dim_location_scd2();`  
-   `CALL JOB_PROSPECTING_DB.EDW.merge_dim_source();`  
-   `CALL JOB_PROSPECTING_DB.EDW.merge_dim_skill_scd2();`
-6. **Fact load:** `CALL JOB_PROSPECTING_DB.EDW.load_fact_job_posting(batch_id);`
-
-The **batch ID** is derived from the Airflow run (e.g. `run_id` or `logical_date`) so each run has a unique identifier.
-
-### 7. Run the DAG
-
-- In the Airflow UI, find **job_prospecting_pipeline** (or the DAG id defined in the script).
-- Unpause the DAG, then trigger a run (e.g. **Trigger DAG**).
-- Monitor task success/failure in the Graph or Grid view.
-
-### 8. Variables (optional)
-
-You can use Airflow Variables to override defaults:
-
-- `snowflake_job_prospecting_database` — e.g. `JOB_PROSPECTING_DB`
-- `snowflake_job_prospecting_schema_staging` — e.g. `STAGING`
-- `snowflake_job_prospecting_schema_edw` — e.g. `EDW`
-
-Set them under **Admin → Variables** if your DAG reads them.
+1. Tableau Desktop → **Connect → Snowflake**.
+2. Server: `<account>.snowflakecomputing.com`. Auth: username/password or SSO.
+3. Warehouse: `TRAFFIC_PEMS_WH`. Database: `TRAFFIC_PEMS_DB`. Schema: `ANALYTICS`.
+4. Drag in any of:
+   - `V_DISTRICT_SUMMARY` — district scorecard (month × district)
+   - `V_WAIT_BY_FREEWAY_HOUR` — hour-of-day patterns by freeway
+   - `V_HOLIDAY_VS_NORMAL` — holiday vs non-holiday comparison
+   - `V_DAY_VS_NIGHT` — daylight vs night by district
+   - `V_TOP_BOTTLENECKS` — worst stations with lat/lon for a map
+5. For `V_WAIT_BY_FREEWAY_HOUR` and `V_DAY_VS_NIGHT` (which scan `fact_traffic_hour`), use a **Tableau extract refreshed nightly** rather than live to keep dashboards snappy.
 
 ---
 
 ## Troubleshooting
 
-| Issue | What to check |
-|-------|----------------|
-| Procedure not found | Use fully qualified names: `JOB_PROSPECTING_DB.STAGING.merge_staging_deduped(...)` and `JOB_PROSPECTING_DB.EDW.load_fact_job_posting(...)`. Ensure you ran `02_*` and `03_pipeline_*.sql` so procedures exist. |
-| No rows in fact | Ensure staging has data for the batch_id you pass. Run `SELECT * FROM JOB_PROSPECTING_DB.STAGING.stg_jobs_deduped WHERE ingest_batch_id = '<batch_id>';`. Then check that dimension lookups (company_nk, location_nk, source_nk) match. |
-| COPY INTO fails | Confirm file format (CSV columns, delimiter, header) matches `FF_CSV_JOBS` and column list. Check stage path and that files are present: `LIST @STG_JOBS_FILES;`. |
-| Airflow Snowflake task fails | Verify connection (Host, account, user, password, warehouse). Ensure database/schema in connection Extra or in the operator match your Snowflake setup. Check task logs for the exact Snowflake error. |
-| dim_date join returns 19000101 | Run **`sql/03_seed_dim_date.sql`** (calendar + sentinel). Re-run the DAG for **new** batches to load facts with real `posted_date_sk`; older fact rows keep prior keys unless you reload them. |
+| Issue | Check |
+|-------|-------|
+| `COPY INTO` parses zero rows | File format `SKIP_HEADER` matches your file (PeMS hourly = 0, metadata = 1). `LIST @STG_PEMS_FILES;` to confirm files are present. |
+| `dim_station` empty after merge | Staging dedupe must run before `merge_dim_station_scd2()`. Confirm `stg_pems_hour_deduped` has rows for the batch. |
+| All fact rows have `posted_date_sk = 19000101` | Run `sql/03_seed_dim_date.sql` so the calendar spine exists. |
+| Snowflake "not authorized" | Use the same role for every script. Trial accounts: `USE ROLE ACCOUNTADMIN;`. Airflow connection role must match. |
+| Tableau dashboards slow | Switch hourly-grain views to an extract, or pre-filter to one district / one month. |
+| Statewide load too expensive | Scale `TRAFFIC_PEMS_WH` up to `MEDIUM` for the initial backfill, then `ALTER WAREHOUSE … SET WAREHOUSE_SIZE = 'X-SMALL';` after. |
 
 ---
 
-## Quick reference: procedure signatures
+## Procedure quick reference
 
-| Procedure | Schema | Arguments |
-|-----------|--------|-----------|
-| `merge_staging_deduped` | STAGING | `(batch_id VARCHAR)` |
-| `merge_dim_company_scd2` | EDW | none |
-| `merge_dim_location_scd2` | EDW | none |
-| `merge_dim_source` | EDW | none |
-| `merge_dim_skill_scd2` | EDW | none |
-| `load_fact_job_posting` | EDW | `(batch_id VARCHAR)` |
-| `close_outdated_fact_rows` | EDW | `(batch_id VARCHAR)` |
+| Procedure | Schema | Args |
+|-----------|--------|------|
+| `merge_pems_staging_deduped` | STAGING | `(batch_id VARCHAR)` |
+| `merge_dim_station_scd2` | EDW | none |
+| `merge_dim_freeway` | EDW | none |
+| `merge_dim_district` | EDW | none (no-op; hand-seeded) |
+| `merge_dim_holiday` | EDW | none (no-op; hand-seeded) |
+| `load_fact_traffic_hour` | EDW | `(batch_id VARCHAR)` |
+| `refresh_agg_traffic_daily` | EDW | `(batch_id VARCHAR)` |
 
-All of the above are in database `JOB_PROSPECTING_DB` (unless you changed it in setup).
+All in database `TRAFFIC_PEMS_DB` unless renamed in `01_setup.sql`.

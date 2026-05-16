@@ -1,98 +1,94 @@
-# Snowflake Job Prospecting — Capstone Project
+# Caltrans PeMS Traffic Analytics — Capstone Project
 
-A capstone project using **Snowflake** to analyze job market data for prospecting: skills in demand, salary trends, roles by location, and hiring patterns.
+A capstone analyzing **California freeway traffic delay and "wait time" patterns** using real Caltrans PeMS detector data. Built on **Snowflake** for the data warehouse, **Apache Airflow** for orchestration, and **Tableau** for dashboards.
 
 ## Overview
 
-- **Goal:** Build a data pipeline and analytics layer in Snowflake to support job prospecting (finding opportunities, understanding requirements, and market trends).
-- **Stack:** Snowflake (warehouse, tables, views), SQL, optional Python for loading data.
-- **Deliverables:** Database setup, sample job data model, analytical views, and example queries you can extend or present.
-- **Pipeline execution:** See **[docs/PIPELINE_EXECUTION.md](docs/PIPELINE_EXECUTION.md)** for step-by-step instructions to run the pipeline in Snowflake and to orchestrate it with **Apache Airflow**.
+- **Question:** When and where do Californians wait the longest in traffic, and how do holidays / time of day / daylight change the pattern?
+- **Data:** [Caltrans Performance Measurement System (PeMS)](https://pems.dot.ca.gov) — 30-second freeway loop-detector readings aggregated to hourly Station data, statewide, ~2022–2024 (3 years × hourly × ~40k stations ≈ 1B rows).
+- **Stack:** Snowflake (warehouse + dimensional model with SCD2), Airflow 3.x (ingest + transform DAG), Tableau (dashboards on the `ANALYTICS` schema).
+- **Pipeline execution:** see **[docs/PIPELINE_EXECUTION.md](docs/PIPELINE_EXECUTION.md)** for PeMS signup, file download, Snowflake script order, and the Airflow DAG.
 
-## Project Structure
+## Project structure
 
 ```
 snowflake/
 ├── README.md
-├── .astro/config.yaml         # Marks repo root as an Astro project (`astro deploy`)
-├── Dockerfile                 # Astro Runtime 3.2 (Airflow 3) — Astronomer / Astro Cloud
-├── Dockerfile.local           # apache/airflow:3.2 — local docker-compose only
+├── .astro/config.yaml             # Astro project marker (deploy from repo root)
+├── Dockerfile                     # Astro Runtime 3.2 (Airflow 3) — for Astronomer / Astro Cloud
+├── Dockerfile.local               # apache/airflow:3.2 — for local docker-compose only
 ├── docker-compose.yaml
-├── docs/
-│   └── PIPELINE_EXECUTION.md  # Snowflake + Airflow / Astro steps
-├── dags/
-│   └── job_prospecting_pipeline_dag.py  # Airflow DAG (canonical path for Astro + compose)
+├── docs/PIPELINE_EXECUTION.md     # PeMS registration + Snowflake + Airflow + Tableau steps
+├── dags/pems_traffic_pipeline_dag.py
 ├── sql/
-│   ├── 01_setup.sql … 03_pipeline_*.sql   # Warehouse → procedures
-│   └── 03_seed_dim_date.sql               # Populate dim_date (nicer posted_date_sk)
-├── airflow/
-│   ├── dags/README.md         # Points to ../dags/
-│   ├── logs/, plugins/
-├── packages.txt               # OS packages for Astro Runtime ONBUILD (may be empty)
-├── requirements.txt           # Extra deps for Astro image (Snowflake provider)
-├── requirements-airflow.txt   # Local venv: Airflow + provider
-└── requirements-airflow-docker.txt  # Local Docker image only
+│   ├── 01_setup.sql                       # Warehouse, DB, schemas, file formats, stages
+│   ├── 02_staging.sql                     # stg_pems_hour_raw / deduped + station meta
+│   ├── 02_dimensions_scd2.sql             # dim_station (SCD2), dim_freeway, dim_district, …
+│   ├── 02_fact.sql                        # fact_traffic_hour + agg_traffic_daily rollup
+│   ├── 03_seed_dim_date.sql               # Calendar 2018–2030 + sentinel
+│   ├── 03_seed_dim_time_of_day.sql        # 24 hours, peak periods, daylight flag
+│   ├── 03_seed_dim_district.sql           # 12 Caltrans districts
+│   ├── 03_seed_dim_holiday.sql            # Federal + CA holidays 2022–2026
+│   ├── 03_pipeline_ingest.sql             # merge_pems_staging_deduped procedure
+│   ├── 03_pipeline_scd2_merge.sql         # SCD2 + dim_freeway procedures
+│   ├── 03_pipeline_fact_load.sql          # Fact load + daily rollup procedures
+│   └── 04_views.sql                       # ANALYTICS views for Tableau
+├── tests/dags/                    # Airflow DAG import / retries / tag tests
+├── packages.txt                   # OS packages for Astro Runtime ONBUILD (may be empty)
+├── requirements.txt               # Astro image — provider deps only
+├── requirements-airflow.txt       # Local venv — Airflow 3 + providers
+└── requirements-airflow-docker.txt # Local docker-compose image
 ```
 
-**Astronomer / Astro CLI:** This repo root is an Astro project (see **`.astro/config.yaml`**). From the repo root run `astro login` then `astro deploy` (or `astro deploy <deployment-id>`). The image uses the root **`Dockerfile`** and **`dags/`** — see [Deploy code](https://www.astronomer.io/docs/astro/deploy-code). The nested **`astro-project/`** folder is an older scaffold; use the **repository root** for deploys.
+## Data model
 
-## Prerequisites
+```
+                  ┌──────────────────────────┐
+                  │  fact_traffic_hour       │
+                  │  grain: station × hour   │◀─┐
+                  │  + agg_traffic_daily     │  │
+                  └──────────────────────────┘  │
+                              │                 │
+   ┌────────────────┬─────────┴──────┬──────────┴────────┬───────────────┐
+   ▼                ▼                ▼                   ▼               ▼
+dim_station    dim_freeway     dim_district        dim_date         dim_time_of_day
+(SCD2)         (Type 1)        (1–12, seeded)      (calendar)       (24 rows)
 
-- Snowflake account (trial: https://signup.snowflake.com)
-- Python 3.8+ (optional, for scripts and Airflow)
-- Snowflake CLI or web UI to run SQL
+                              dim_holiday (CA + federal 2022–2026)
+```
 
-## Quick Start
+Derived "wait" measure:
+```
+delay_min_per_veh = max( (1/avg_speed − 1/65) × length × 60, 0 )
+delay_veh_hours    = max( (1/avg_speed − 1/65) × length × total_flow, 0 )
+```
+65 mph is the free-flow reference (typical California mainline posted limit; tune per lane type if needed).
 
-### 1. Snowflake setup
+## Quick start
 
-In Snowflake (Worksheets or SnowSQL), run in order:
+1. **Register for PeMS** (`pems.dot.ca.gov`) — Caltrans approval is manual, takes 1–3 business days.
+2. **Download** "Station Hour" exports for the districts/years you want (see [docs/PIPELINE_EXECUTION.md](docs/PIPELINE_EXECUTION.md)).
+3. **Run** `sql/01_setup.sql` → `02_*.sql` → `03_seed_*.sql` → `03_pipeline_*.sql` → `04_views.sql` in Snowflake (in that order, idempotent).
+4. **Upload** files to `@TRAFFIC_PEMS_DB.STAGING.STG_PEMS_FILES` via Snowsight or `PUT`.
+5. **Trigger** the `pems_traffic_pipeline` Airflow DAG (or run the Phase 2/3 SQL manually).
+6. **Connect Tableau** → Snowflake → `TRAFFIC_PEMS_DB.ANALYTICS` schema → build dashboards on `v_*` views.
+
+## Local development
 
 ```bash
-# From project root, or copy-paste from each file:
-# sql/01_setup.sql
-# sql/02_tables.sql
-# sql/03_sample_data.sql
-# sql/04_views.sql
+cp -n .env.example .env
+docker compose up --build -d        # Airflow UI at http://localhost:8080 (admin / admin)
+pytest tests/                       # DAG import / tags / retries checks
 ```
 
-### 2. Load sample data (optional)
+## Deploy to Astronomer
 
-If you have a `data/sample_jobs.csv`:
-
+The **repo root** is the Astro project (`.astro/config.yaml`). Use the root `Dockerfile` + `requirements.txt`.
 ```bash
-pip install -r requirements.txt
-# Set env vars: SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD, SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA
-python scripts/load_sample_jobs.py
+astro login
+astro deploy                        # or: astro deploy <deployment-id>
 ```
-
-Or run `sql/03_sample_data.sql` to insert a small seed dataset directly.
-
-### 3. Run analytics
-
-Query the views in `sql/04_views.sql`, for example:
-
-- `v_jobs_by_role` — job counts by job title
-- `v_skills_in_demand` — most requested skills
-- `v_salary_by_role_location` — salary stats by role and location
-- `v_recent_postings` — latest postings for prospecting
-
-## Data Model (Summary)
-
-| Table       | Purpose |
-|------------|---------|
-| `jobs`     | Job postings (title, company, location, salary range, posted_date, etc.) |
-| `job_skills`| Many-to-many: which skills are required per job |
-| `skills`   | Skill dimension (name, category) |
-
-You can extend with `companies`, `applications`, or external API feeds.
-
-## Customization
-
-- **Your own data:** Replace `data/sample_jobs.csv` with exported job data (e.g., from LinkedIn, Indeed, or course datasets) and adjust column names in `02_tables.sql` and `load_sample_jobs.py` if needed.
-- **More tables:** Add `sql/02_tables.sql` DDL for companies, industries, or time-series tables.
-- **Presentations:** Use the views and example queries in reports or slides; optionally connect BI tools (Tableau, Streamlit) to Snowflake.
 
 ## License
 
-For academic use; adapt as needed for your course requirements.
+For academic use; adapt as needed for course requirements.

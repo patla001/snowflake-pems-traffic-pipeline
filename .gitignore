@@ -81,3 +81,12 @@ id_rsa.pub
 *~
 .DS_Store
 Thumbs.db
+
+# --- Local data downloads (PeMS exports are large; never commit) ---
+data/
+
+# --- Airflow runtime logs at repo root (from local docker-compose) ---
+logs/
+
+# --- Claude Code session metadata ---
+.claude/

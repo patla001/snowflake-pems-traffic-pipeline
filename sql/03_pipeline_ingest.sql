@@ -1,96 +1,103 @@
 -- ============================================================
--- 03_pipeline_ingest.sql — Big data ingest: COPY INTO from stage
--- Data engineering: bulk load from files, batch id for idempotency
+-- 03_pipeline_ingest.sql — PeMS ingest helpers
+-- COPY INTO from @STG_PEMS_FILES and dedupe to stg_pems_hour_deduped.
 -- ============================================================
 --
--- No USE DATABASE / USE SCHEMA; procedure is created under JOB_PROSPECTING_DB.STAGING.
+-- COPY INTO example (run from orchestration with a unique batch_id):
+--
+--   SET batch_id = (SELECT TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISS'));
+--   COPY INTO TRAFFIC_PEMS_DB.STAGING.stg_pems_hour_raw (
+--     ingest_batch_id, file_name, file_row_number,
+--     station_id, sample_datetime, district, freeway, direction_of_travel,
+--     lane_type, station_length_mi, samples, pct_observed,
+--     total_flow_veh, avg_occupancy, avg_speed_mph
+--   )
+--   FROM (
+--     SELECT
+--       $batch_id,
+--       METADATA$FILENAME,
+--       METADATA$FILE_ROW_NUMBER,
+--       $2::INTEGER,                                              -- station_id
+--       TO_TIMESTAMP_NTZ($1, 'MM/DD/YYYY HH24:MI:SS'),            -- sample_datetime
+--       $3::SMALLINT,                                             -- district
+--       $4::SMALLINT,                                             -- freeway
+--       $5::VARCHAR,                                              -- direction
+--       $6::VARCHAR,                                              -- lane_type
+--       $7::NUMBER(6,3),                                          -- station_length_mi
+--       $8::INTEGER,                                              -- samples
+--       $9::NUMBER(5,2),                                          -- pct_observed
+--       $10::NUMBER(10,2),                                        -- total_flow_veh
+--       $11::NUMBER(8,6),                                         -- avg_occupancy
+--       $12::NUMBER(6,2)                                          -- avg_speed_mph
+--     FROM @TRAFFIC_PEMS_DB.STAGING.STG_PEMS_FILES
+--   )
+--   FILE_FORMAT = (FORMAT_NAME = 'TRAFFIC_PEMS_DB.STAGING.FF_CSV_PEMS')
+--   ON_ERROR = 'CONTINUE';
 -- ============================================================
 
--- Example: load CSV from internal stage into stg_jobs_raw
--- Replace column list and stage path with your file layout
--- Run with a unique ingest_batch_id per run (e.g., from task or pipeline tool)
+USE ROLE ACCOUNTADMIN;
+USE DATABASE TRAFFIC_PEMS_DB;
+USE SCHEMA STAGING;
 
--- Option A: COPY INTO with explicit columns and batch id (run from orchestration)
--- SET batch_id = (SELECT UUID_STRING());
--- COPY INTO stg_jobs_raw (
---   ingest_batch_id,
---   file_name,
---   row_number,
---   source_system,
---   external_job_id,
---   title,
---   company_name,
---   location_raw,
---   location_type,
---   salary_min,
---   salary_max,
---   salary_currency,
---   job_url,
---   posted_date,
---   skills_raw
--- )
--- FROM (
---   SELECT
---     $batch_id,
---     METADATA$FILENAME,
---     METADATA$FILE_ROW_NUMBER,
---     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
---   FROM @STG_JOBS_FILES
--- )
--- FILE_FORMAT = (FORMAT_NAME = 'JOB_PROSPECTING_DB.STAGING.FF_CSV_JOBS')
--- ON_ERROR = 'CONTINUE';
-
--- Option B: Merge staging into deduped table (latest record per natural key per batch)
--- Call after COPY INTO to prepare one row per (source_system, external_job_id) for this batch
-CREATE OR REPLACE PROCEDURE JOB_PROSPECTING_DB.STAGING.merge_staging_deduped(batch_id VARCHAR)
+-- Dedupe raw → deduped: keep latest row per (station_id, sample_datetime).
+-- Tie-break by ingest_ts (most recent wins) so reruns of a file override
+-- prior loads cleanly.
+CREATE OR REPLACE PROCEDURE TRAFFIC_PEMS_DB.STAGING.merge_pems_staging_deduped(batch_id VARCHAR)
   RETURNS VARCHAR
   LANGUAGE SQL
   AS
   $$
   BEGIN
-    MERGE INTO stg_jobs_deduped t
+    MERGE INTO stg_pems_hour_deduped t
     USING (
       SELECT
-        source_system,
-        external_job_id,
-        title,
-        company_name,
-        location_raw,
-        location_type,
-        salary_min,
-        salary_max,
-        salary_currency,
-        job_url,
-        posted_date,
-        skills_raw,
-        source_updated_at,
+        station_id,
+        sample_datetime,
+        district,
+        freeway,
+        direction_of_travel,
+        lane_type,
+        station_length_mi,
+        samples,
+        pct_observed,
+        total_flow_veh,
+        avg_occupancy,
+        avg_speed_mph,
         ingest_batch_id
-      FROM stg_jobs_raw
-      WHERE ingest_batch_id = :batch_id
+      FROM (
+        SELECT
+          r.*,
+          ROW_NUMBER() OVER (
+            PARTITION BY station_id, sample_datetime
+            ORDER BY ingest_ts DESC
+          ) AS rn
+        FROM stg_pems_hour_raw r
+        WHERE ingest_batch_id = :batch_id
+      )
+      WHERE rn = 1
     ) s
-    ON t.source_system = s.source_system AND t.external_job_id = s.external_job_id
-    WHEN MATCHED AND t.ingest_batch_id < s.ingest_batch_id THEN UPDATE SET
-      title = s.title,
-      company_name = s.company_name,
-      location_raw = s.location_raw,
-      location_type = s.location_type,
-      salary_min = s.salary_min,
-      salary_max = s.salary_max,
-      salary_currency = s.salary_currency,
-      job_url = s.job_url,
-      posted_date = s.posted_date,
-      skills_raw = s.skills_raw,
-      source_updated_at = s.source_updated_at,
+    ON t.station_id = s.station_id AND t.sample_datetime = s.sample_datetime
+    WHEN MATCHED THEN UPDATE SET
+      district = s.district,
+      freeway = s.freeway,
+      direction_of_travel = s.direction_of_travel,
+      lane_type = s.lane_type,
+      station_length_mi = s.station_length_mi,
+      samples = s.samples,
+      pct_observed = s.pct_observed,
+      total_flow_veh = s.total_flow_veh,
+      avg_occupancy = s.avg_occupancy,
+      avg_speed_mph = s.avg_speed_mph,
       ingest_batch_id = s.ingest_batch_id
     WHEN NOT MATCHED THEN INSERT (
-      source_system, external_job_id, title, company_name, location_raw,
-      location_type, salary_min, salary_max, salary_currency, job_url,
-      posted_date, skills_raw, source_updated_at, ingest_batch_id
+      station_id, sample_datetime, district, freeway, direction_of_travel,
+      lane_type, station_length_mi, samples, pct_observed,
+      total_flow_veh, avg_occupancy, avg_speed_mph, ingest_batch_id
     ) VALUES (
-      s.source_system, s.external_job_id, s.title, s.company_name, s.location_raw,
-      s.location_type, s.salary_min, s.salary_max, s.salary_currency, s.job_url,
-      s.posted_date, s.skills_raw, s.source_updated_at, s.ingest_batch_id
+      s.station_id, s.sample_datetime, s.district, s.freeway, s.direction_of_travel,
+      s.lane_type, s.station_length_mi, s.samples, s.pct_observed,
+      s.total_flow_veh, s.avg_occupancy, s.avg_speed_mph, s.ingest_batch_id
     );
-    RETURN 'OK: merged batch ' || :batch_id;
+    RETURN 'OK: merged PeMS batch ' || :batch_id;
   END;
   $$;

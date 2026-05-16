@@ -1,71 +1,104 @@
 -- ============================================================
--- 02_staging.sql — Staging (landing) layer for big data ingest
--- Data engineering: raw landing table with batch metadata for idempotency
+-- 02_staging.sql — Landing layer for PeMS Data Clearinghouse exports
+-- Two raw tables: hourly station readings + station metadata inventory
 -- ============================================================
 --
--- PREREQUISITES
--- 1) Run sql/01_setup.sql first (recommended). This file can still bootstrap DB + STAGING alone.
--- 2) Picking a database in the Snowflake UI sidebar does NOT always set SQL session context.
---    We avoid USE DATABASE here so DDL uses only fully-qualified names (no session DB required).
--- 3) Use a role that can create databases/schemas/tables (trial: ACCOUNTADMIN).
+-- PeMS file references (Data Clearinghouse → Type = "Station Hour" / "Meta"):
+--   Hourly Station Data — positional columns, no header in the .gz download
+--   Station Metadata    — header row, semi-static inventory of detector locations
+--
+-- Natural keys:
+--   stg_pems_hour_raw    : (station_id, sample_datetime)
+--   stg_pems_station_meta_raw : (station_id, meta_effective_date)
 -- ============================================================
 
--- Make the active role explicit (worksheets often default to SYSADMIN).
 USE ROLE ACCOUNTADMIN;
+USE DATABASE TRAFFIC_PEMS_DB;
+USE SCHEMA STAGING;
 
-CREATE DATABASE IF NOT EXISTS JOB_PROSPECTING_DB
-  COMMENT = 'Job prospecting capstone - dimensional model + SCD2';
-
-CREATE SCHEMA IF NOT EXISTS JOB_PROSPECTING_DB.STAGING
-  COMMENT = 'Landing zone for raw job data; batch and incremental loads';
-
--- Raw landing table: one row per job posting as ingested from files
--- Supports big data: high volume, partition-friendly (ingest_batch_id, ingest_ts)
--- Natural key: source + external_id for deduplication and incremental loads
-CREATE TABLE IF NOT EXISTS JOB_PROSPECTING_DB.STAGING.stg_jobs_raw (
-  -- Batch / pipeline metadata (big data: partition and reprocess by batch)
-  ingest_batch_id   VARCHAR(100) NOT NULL,
-  ingest_ts         TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-  file_name         VARCHAR(500),
-  row_number        INTEGER,
-  -- Natural key for upsert and SCD source
-  source_system     VARCHAR(100) NOT NULL,
-  external_job_id   VARCHAR(255) NOT NULL,
-  -- Business attributes (as landed)
-  title             VARCHAR(500),
-  company_name      VARCHAR(500),
-  location_raw      VARCHAR(500),
-  location_type     VARCHAR(50),
-  salary_min        NUMBER(12, 2),
-  salary_max        NUMBER(12, 2),
-  salary_currency   VARCHAR(3),
-  job_url           VARCHAR(2000),
-  posted_date       DATE,
-  description       VARCHAR(16777216),
-  skills_raw        VARCHAR(10000),   -- comma-separated or JSON for parsing
-  -- Dedupe and incremental
-  source_updated_at TIMESTAMP_NTZ,
-  PRIMARY KEY (source_system, external_job_id, ingest_batch_id)
+-- Hourly station observations as landed from PeMS Station Hour exports.
+-- PeMS column order (5-min and hour exports share the first ~12 columns):
+--   1  Timestamp (e.g. 01/01/2024 13:00:00)
+--   2  Station ID
+--   3  District
+--   4  Freeway
+--   5  Direction of Travel
+--   6  Lane Type
+--   7  Station Length (mi)
+--   8  Samples (count)
+--   9  % Observed
+--   10 Total Flow (vehicles in the hour)
+--   11 Avg Occupancy (0.0–1.0)
+--   12 Avg Speed (mph)
+--   (per-lane columns 13+ are intentionally not staged here)
+CREATE TABLE IF NOT EXISTS TRAFFIC_PEMS_DB.STAGING.stg_pems_hour_raw (
+  ingest_batch_id     VARCHAR(100) NOT NULL,
+  ingest_ts           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  file_name           VARCHAR(500),
+  file_row_number     INTEGER,
+  -- Natural key
+  station_id          INTEGER NOT NULL,
+  sample_datetime     TIMESTAMP_NTZ NOT NULL,
+  -- PeMS columns (positional)
+  district            SMALLINT,
+  freeway             SMALLINT,
+  direction_of_travel VARCHAR(2),
+  lane_type           VARCHAR(4),
+  station_length_mi   NUMBER(6, 3),
+  samples             INTEGER,
+  pct_observed        NUMBER(5, 2),
+  total_flow_veh      NUMBER(10, 2),
+  avg_occupancy       NUMBER(8, 6),
+  avg_speed_mph       NUMBER(6, 2),
+  PRIMARY KEY (station_id, sample_datetime, ingest_batch_id)
 );
 
--- Clustering for big data: range queries and incremental by batch/date
-ALTER TABLE JOB_PROSPECTING_DB.STAGING.stg_jobs_raw CLUSTER BY (ingest_batch_id, posted_date);
+ALTER TABLE TRAFFIC_PEMS_DB.STAGING.stg_pems_hour_raw
+  CLUSTER BY (DATE_TRUNC('DAY', sample_datetime), district);
 
--- Staging for dimension lookups during SCD2: current snapshot of staging for this batch
-CREATE TABLE IF NOT EXISTS JOB_PROSPECTING_DB.STAGING.stg_jobs_deduped (
-  source_system     VARCHAR(100) NOT NULL,
-  external_job_id   VARCHAR(255) NOT NULL,
-  title             VARCHAR(500),
-  company_name      VARCHAR(500),
-  location_raw      VARCHAR(500),
-  location_type     VARCHAR(50),
-  salary_min        NUMBER(12, 2),
-  salary_max        NUMBER(12, 2),
-  salary_currency   VARCHAR(3),
-  job_url           VARCHAR(2000),
-  posted_date       DATE,
-  skills_raw        VARCHAR(10000),
-  source_updated_at TIMESTAMP_NTZ,
-  ingest_batch_id   VARCHAR(100) NOT NULL,
-  PRIMARY KEY (source_system, external_job_id)
+-- Deduped staging: one row per (station, sample_datetime) per batch
+CREATE TABLE IF NOT EXISTS TRAFFIC_PEMS_DB.STAGING.stg_pems_hour_deduped (
+  station_id          INTEGER NOT NULL,
+  sample_datetime     TIMESTAMP_NTZ NOT NULL,
+  district            SMALLINT,
+  freeway             SMALLINT,
+  direction_of_travel VARCHAR(2),
+  lane_type           VARCHAR(4),
+  station_length_mi   NUMBER(6, 3),
+  samples             INTEGER,
+  pct_observed        NUMBER(5, 2),
+  total_flow_veh      NUMBER(10, 2),
+  avg_occupancy       NUMBER(8, 6),
+  avg_speed_mph       NUMBER(6, 2),
+  ingest_batch_id     VARCHAR(100) NOT NULL,
+  PRIMARY KEY (station_id, sample_datetime)
+);
+
+ALTER TABLE TRAFFIC_PEMS_DB.STAGING.stg_pems_hour_deduped
+  CLUSTER BY (DATE_TRUNC('DAY', sample_datetime), district);
+
+-- Station metadata inventory (Meta export). Effective-dated by Caltrans;
+-- changes capture mile-marker corrections, lane reconfigurations, etc.
+CREATE TABLE IF NOT EXISTS TRAFFIC_PEMS_DB.STAGING.stg_pems_station_meta_raw (
+  ingest_batch_id     VARCHAR(100) NOT NULL,
+  ingest_ts           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  file_name           VARCHAR(500),
+  -- Natural key
+  station_id          INTEGER NOT NULL,
+  meta_effective_date DATE NOT NULL,
+  -- PeMS Meta columns
+  freeway             SMALLINT,
+  direction_of_travel VARCHAR(2),
+  district            SMALLINT,
+  county_id           SMALLINT,
+  city_id             INTEGER,
+  state_pm            VARCHAR(20),
+  abs_pm              NUMBER(8, 3),
+  latitude            NUMBER(9, 6),
+  longitude           NUMBER(9, 6),
+  length_mi           NUMBER(6, 3),
+  station_type        VARCHAR(4),    -- ML, HV, OR, FR, FF, CD, CH, HOV
+  lane_count          SMALLINT,
+  station_name        VARCHAR(200),
+  PRIMARY KEY (station_id, meta_effective_date)
 );
