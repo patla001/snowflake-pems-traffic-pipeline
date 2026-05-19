@@ -98,6 +98,7 @@ CREATE OR REPLACE PROCEDURE TRAFFIC_PEMS_DB.STAGING.merge_pems_staging_deduped(b
       s.lane_type, s.station_length_mi, s.samples, s.pct_observed,
       s.total_flow_veh, s.avg_occupancy, s.avg_speed_mph, s.ingest_batch_id
     );
+    COMMIT;
     RETURN 'OK: merged PeMS batch ' || :batch_id;
   END;
   $$;

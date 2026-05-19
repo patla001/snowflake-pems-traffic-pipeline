@@ -75,6 +75,7 @@ CREATE OR REPLACE PROCEDURE TRAFFIC_PEMS_DB.EDW.load_fact_traffic_hour(batch_id 
         WHERE f.station_sk = st.station_sk
           AND f.sample_datetime = s.sample_datetime
       );
+    COMMIT;
     RETURN 'OK: fact_traffic_hour loaded for batch ' || :batch_id;
   END;
   $$;
@@ -133,6 +134,7 @@ CREATE OR REPLACE PROCEDURE TRAFFIC_PEMS_DB.EDW.refresh_agg_traffic_daily(batch_
       s.peak_hour_speed_mph, s.total_delay_veh_hours, s.total_vmt, s.total_vht,
       :batch_id
     );
+    COMMIT;
     RETURN 'OK: agg_traffic_daily refreshed for batch ' || :batch_id;
   END;
   $$;

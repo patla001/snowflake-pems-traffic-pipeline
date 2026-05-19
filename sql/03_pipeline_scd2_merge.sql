@@ -112,6 +112,7 @@ CREATE OR REPLACE PROCEDURE TRAFFIC_PEMS_DB.EDW.merge_dim_station_scd2()
     ) m
     WHERE d.station_nk = m.station_id AND d.is_current;
 
+    COMMIT;
     RETURN 'OK: dim_station SCD2 merge done';
   END;
   $$;
@@ -144,6 +145,7 @@ CREATE OR REPLACE PROCEDURE TRAFFIC_PEMS_DB.EDW.merge_dim_freeway()
         AND f.direction_of_travel = s.direction_of_travel
     )
     GROUP BY s.freeway, s.direction_of_travel;
+    COMMIT;
     RETURN 'OK: dim_freeway merge done';
   END;
   $$;
