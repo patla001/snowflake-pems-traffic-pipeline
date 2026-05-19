@@ -2,6 +2,50 @@
 
 A capstone analyzing **California freeway traffic delay and "wait time" patterns** using real Caltrans PeMS detector data. Built on **Snowflake** for the data warehouse, **Apache Airflow** for orchestration, and **Tableau** for dashboards.
 
+## Architecture
+
+End-to-end flow from raw Caltrans PeMS exports on a laptop, through a Snowflake medallion-style layering, into Tableau. Solid arrows are batch hand-offs; dashed arrows are Airflow DAG tasks running in Snowflake.
+
+```mermaid
+flowchart LR
+    pems[("Caltrans PeMS<br/>District 11 hourly exports<br/>2015 – 2026")]
+    local["Local laptop<br/>data/station-hour/*.txt.gz<br/>data/metadata/*.txt"]
+
+    subgraph staging ["Snowflake · STAGING schema"]
+      direction TB
+      stage1[("@STG_PEMS_FILES")]
+      stage2[("@STG_PEMS_META_FILES")]
+      raw["stg_pems_hour_raw"]
+      dedup["stg_pems_hour_deduped"]
+    end
+
+    subgraph edw ["Snowflake · EDW schema (star)"]
+      direction TB
+      dims["dim_station (SCD2) · dim_freeway · dim_district<br/>dim_date · dim_holiday · dim_time_of_day"]
+      fact[("fact_traffic_hour<br/>~133 M rows")]
+      agg[("agg_traffic_daily<br/>daily rollup")]
+    end
+
+    subgraph ana ["Snowflake · ANALYTICS schema"]
+      views["v_district_summary · v_wait_by_freeway_hour<br/>v_holiday_vs_normal · v_day_vs_night · v_top_bottlenecks"]
+    end
+    tableau["Tableau<br/>dashboards"]
+
+    pems -->|manual download| local
+    local -->|scripts/r3_backfill_year.sh<br/>SnowSQL PUT| stage1
+    local -->|SnowSQL PUT| stage2
+    stage1 -.->|Airflow · copy_pems_to_staging| raw
+    raw -.->|Airflow · merge_staging_deduped| dedup
+    dedup -.->|Airflow · scd2_dim_station<br/>+ merge_dim_freeway| dims
+    stage2 -.->|enriches| dims
+    dedup -.->|Airflow · load_fact_traffic_hour| fact
+    dims --> fact
+    fact -.->|Airflow · refresh_agg_traffic_daily| agg
+    fact --> views
+    agg --> views
+    views --> tableau
+```
+
 ## Overview
 
 - **Question:** When and where do Californians wait the longest in traffic, and how do holidays / time of day / daylight change the pattern?
@@ -25,7 +69,7 @@ snowflake/
 │   ├── 02_staging.sql                     # stg_pems_hour_raw / deduped + station meta
 │   ├── 02_dimensions_scd2.sql             # dim_station (SCD2), dim_freeway, dim_district, …
 │   ├── 02_fact.sql                        # fact_traffic_hour + agg_traffic_daily rollup
-│   ├── 03_seed_dim_date.sql               # Calendar 2018–2030 + sentinel
+│   ├── 03_seed_dim_date.sql               # Calendar 2015–2030 + sentinel
 │   ├── 03_seed_dim_time_of_day.sql        # 24 hours, peak periods, daylight flag
 │   ├── 03_seed_dim_district.sql           # 12 Caltrans districts
 │   ├── 03_seed_dim_holiday.sql            # Federal + CA holidays 2022–2026
