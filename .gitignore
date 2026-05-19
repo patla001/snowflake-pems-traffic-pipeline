@@ -90,3 +90,8 @@ logs/
 
 # --- Claude Code session metadata ---
 .claude/
+
+# --- Tableau lock / autosave / backup files (keep .twb workbooks) ---
+*.twbr
+.~*.twb*
+*.twb.tmp
