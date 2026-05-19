@@ -1,6 +1,6 @@
 -- ============================================================
 -- 03_seed_dim_date.sql — Populate EDW.dim_date (calendar + sentinel)
--- Idempotent MERGE; safe to re-run. Spine covers 2018-01-01 → 2030-12-31.
+-- Idempotent MERGE; safe to re-run. Spine covers 2015-01-01 → 2030-12-31.
 -- ============================================================
 
 USE ROLE ACCOUNTADMIN;
@@ -31,7 +31,7 @@ WHEN NOT MATCHED THEN
   VALUES (s.date_sk, s.full_date, s.year, s.quarter, s.month, s.month_name,
           s.day_of_month, s.day_of_week, s.day_name, s.week_of_year, s.is_weekend);
 
--- Calendar spine: 2018-01-01 → 2030-12-31 (covers backfill + future loads)
+-- Calendar spine: 2015-01-01 → 2030-12-31 (covers full D11 backfill + future loads)
 MERGE INTO TRAFFIC_PEMS_DB.EDW.dim_date t
 USING (
   SELECT
@@ -47,8 +47,8 @@ USING (
     WEEKOFYEAR(d)::SMALLINT AS week_of_year,
     (DAYOFWEEK(d) IN (0, 6)) AS is_weekend
   FROM (
-    SELECT DATEADD(day, SEQ4(), DATE '2018-01-01') AS d
-    FROM TABLE(GENERATOR(ROWCOUNT => 5000))
+    SELECT DATEADD(day, SEQ4(), DATE '2015-01-01') AS d
+    FROM TABLE(GENERATOR(ROWCOUNT => 6000))
   ) spine
   WHERE d <= DATE '2030-12-31'
 ) s

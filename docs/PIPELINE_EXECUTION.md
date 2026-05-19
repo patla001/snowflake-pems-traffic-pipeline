@@ -75,7 +75,7 @@ Run in this order in Snowsight or SnowSQL. All scripts are idempotent.
 | 2 | `sql/02_staging.sql` | Staging tables (`stg_pems_hour_raw/deduped`, `stg_pems_station_meta_raw`) |
 | 3 | `sql/02_dimensions_scd2.sql` | Dimensions (SCD2 `dim_station` + `dim_freeway`, `dim_district`, `dim_time_of_day`, `dim_holiday`, `dim_date`) |
 | 4 | `sql/02_fact.sql` | `fact_traffic_hour` + `agg_traffic_daily` rollup |
-| 5 | `sql/03_seed_dim_date.sql` | Calendar 2018–2030 + sentinel |
+| 5 | `sql/03_seed_dim_date.sql` | Calendar 2015–2030 + sentinel |
 | 6 | `sql/03_seed_dim_time_of_day.sql` | 24 rows, peak periods |
 | 7 | `sql/03_seed_dim_district.sql` | 12 Caltrans districts |
 | 8 | `sql/03_seed_dim_holiday.sql` | Federal + CA holidays 2022–2026 |

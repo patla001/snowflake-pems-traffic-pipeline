@@ -52,7 +52,7 @@ pip install -r requirements-airflow.txt
 - **`dim_district`** — 12 Caltrans districts, hand-seeded.
 - **`dim_holiday`** — Federal + CA state holidays 2022–2026, hand-seeded with `is_travel_heavy` flag.
 - **`dim_time_of_day`** — 24 rows, peak periods (AM_PEAK / MIDDAY / PM_PEAK / EVENING / OVERNIGHT), `is_daylight_approx`.
-- **`dim_date`** — calendar 2018–2030 + `19000101` sentinel for unmatched dates.
+- **`dim_date`** — calendar 2015–2030 + `19000101` sentinel for unmatched dates.
 
 ### Pipeline execution order (`sql/`)
 ```
