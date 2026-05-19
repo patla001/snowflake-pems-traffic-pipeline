@@ -13,14 +13,16 @@ USE ROLE ACCOUNTADMIN;
 USE DATABASE TRAFFIC_PEMS_DB;
 USE SCHEMA ANALYTICS;
 
--- 1) Wait/delay by freeway × hour-of-day across the most recent 90 days.
--- "Wait" framed as average delay minutes per vehicle (travel-time penalty
--- versus free-flow). Joined to peak_period labels and daylight flag so
--- Tableau can split AM_PEAK vs OVERNIGHT, daylight vs night.
+-- 1) Wait/delay by freeway × hour-of-day across the full available history.
+-- Filter dates at the Tableau workbook level (a parameter-driven date range
+-- is more useful than a hardcoded cutoff once a multi-year backfill is loaded).
+-- Hourly grain ≈ 100M+ rows — use a Tableau extract refreshed nightly, not live.
 CREATE OR REPLACE VIEW TRAFFIC_PEMS_DB.ANALYTICS.v_wait_by_freeway_hour AS
 SELECT
   f.posted_date_sk,
   d.full_date,
+  d.year,
+  d.month,
   d.day_name,
   d.is_weekend,
   fwy.freeway_label,
@@ -43,8 +45,7 @@ JOIN TRAFFIC_PEMS_DB.EDW.dim_freeway  fwy  ON fwy.freeway_sk  = f.freeway_sk
 JOIN TRAFFIC_PEMS_DB.EDW.dim_district dist ON dist.district_sk = f.district_sk
 JOIN TRAFFIC_PEMS_DB.EDW.dim_date     d    ON d.date_sk        = f.posted_date_sk
 JOIN TRAFFIC_PEMS_DB.EDW.dim_time_of_day tod ON tod.hour_sk    = f.hour_sk
-WHERE d.full_date >= DATEADD(day, -90, CURRENT_DATE())
-GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15;
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17;
 
 -- 2) Holiday vs non-holiday: same freeway, same calendar window, holiday flag.
 -- Uses the daily rollup for speed; surfaces 95th-percentile delay so Tableau
@@ -72,12 +73,14 @@ JOIN TRAFFIC_PEMS_DB.EDW.dim_date     d    ON d.date_sk        = agg.posted_date
 LEFT JOIN TRAFFIC_PEMS_DB.EDW.dim_holiday h ON h.holiday_date  = d.full_date
 GROUP BY 1,2,3,4,5,6,7,8,9,10;
 
--- 3) Daylight vs nighttime patterns by district.
--- Uses hourly fact to keep day/night classification accurate; aggregates to
--- one row per district × date × time_class for fast Tableau queries.
+-- 3) Daylight vs nighttime patterns by district, full available history.
+-- Filter dates in Tableau if you want a recent window. Hourly grain —
+-- use an extract for performance, not a live connection.
 CREATE OR REPLACE VIEW TRAFFIC_PEMS_DB.ANALYTICS.v_day_vs_night AS
 SELECT
   d.full_date,
+  d.year,
+  d.month,
   d.day_name,
   d.is_weekend,
   dist.district_sk,
@@ -93,12 +96,11 @@ FROM TRAFFIC_PEMS_DB.EDW.fact_traffic_hour f
 JOIN TRAFFIC_PEMS_DB.EDW.dim_district dist ON dist.district_sk = f.district_sk
 JOIN TRAFFIC_PEMS_DB.EDW.dim_date     d    ON d.date_sk        = f.posted_date_sk
 JOIN TRAFFIC_PEMS_DB.EDW.dim_time_of_day tod ON tod.hour_sk    = f.hour_sk
-WHERE d.full_date >= DATEADD(day, -90, CURRENT_DATE())
-GROUP BY 1,2,3,4,5,6,7;
+GROUP BY 1,2,3,4,5,6,7,8,9;
 
--- 4) Top bottlenecks: stations with the worst average delay over the last 30
--- days. One row per station with location and aggregated metrics so Tableau
--- can plot lat/lon and filter to top N.
+-- 4) Top bottlenecks: stations ranked by cumulative delay across the full
+-- available history. Filter dates in Tableau to scope to a specific year or
+-- date range. Plots lat/lon so Tableau can render a map + filter to top N.
 CREATE OR REPLACE VIEW TRAFFIC_PEMS_DB.ANALYTICS.v_top_bottlenecks AS
 SELECT
   st.station_nk            AS station_id,
@@ -111,6 +113,7 @@ SELECT
   st.longitude,
   dist.district_name,
   dist.region,
+  d.year,
   COUNT(*)                       AS days_observed,
   AVG(agg.avg_speed_mph)         AS avg_speed_mph,
   AVG(agg.peak_hour_speed_mph)   AS avg_peak_hour_speed_mph,
@@ -121,10 +124,11 @@ FROM TRAFFIC_PEMS_DB.EDW.agg_traffic_daily agg
 JOIN TRAFFIC_PEMS_DB.EDW.dim_station st  ON st.station_sk = agg.station_sk AND st.is_current
 JOIN TRAFFIC_PEMS_DB.EDW.dim_district dist ON dist.district_sk = agg.district_sk
 JOIN TRAFFIC_PEMS_DB.EDW.dim_date     d   ON d.date_sk        = agg.posted_date_sk
-WHERE d.full_date >= DATEADD(day, -30, CURRENT_DATE())
-GROUP BY 1,2,3,4,5,6,7,8,9,10
+WHERE st.station_type = 'ML'   -- mainline only; ramps (FR/OR/FF) lack speed data
+  AND agg.total_delay_veh_hours IS NOT NULL
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11
 HAVING COUNT(*) >= 10
-ORDER BY sum_delay_veh_hours DESC;
+ORDER BY sum_delay_veh_hours DESC NULLS LAST;
 
 -- 5) District summary: month × district scorecard for executive view.
 CREATE OR REPLACE VIEW TRAFFIC_PEMS_DB.ANALYTICS.v_district_summary AS
