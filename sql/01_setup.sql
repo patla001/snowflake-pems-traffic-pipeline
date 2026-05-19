@@ -64,13 +64,26 @@ CREATE OR REPLACE FILE FORMAT TRAFFIC_PEMS_DB.STAGING.FF_CSV_PEMS_META
   EMPTY_FIELD_AS_NULL = TRUE
   COMMENT = 'TAB-delimited format for PeMS Station Metadata exports (header row present, 18 columns)';
 
+-- DIRECTORY = ( ENABLE = TRUE ) powers the Snowsight Stages browser.
+-- Without it, files uploaded via PUT are still readable by COPY INTO + LIST,
+-- but they don't appear in the Snowsight Catalog UI (silent UX trap).
 CREATE STAGE IF NOT EXISTS TRAFFIC_PEMS_DB.STAGING.STG_PEMS_FILES
   FILE_FORMAT = (FORMAT_NAME = 'TRAFFIC_PEMS_DB.STAGING.FF_CSV_PEMS')
+  DIRECTORY = ( ENABLE = TRUE )
   COMMENT = 'Stage for PeMS hourly station data files (one folder per district/year recommended)';
 
 CREATE STAGE IF NOT EXISTS TRAFFIC_PEMS_DB.STAGING.STG_PEMS_META_FILES
   FILE_FORMAT = (FORMAT_NAME = 'TRAFFIC_PEMS_DB.STAGING.FF_CSV_PEMS_META')
+  DIRECTORY = ( ENABLE = TRUE )
   COMMENT = 'Stage for PeMS station inventory / metadata files';
+
+-- For stages that already existed before the DIRECTORY clause above was added
+-- (CREATE STAGE IF NOT EXISTS is a no-op when the stage exists, so won't apply
+-- the new option), enable + refresh in place. Both statements are idempotent.
+ALTER STAGE TRAFFIC_PEMS_DB.STAGING.STG_PEMS_FILES        SET DIRECTORY = ( ENABLE = TRUE );
+ALTER STAGE TRAFFIC_PEMS_DB.STAGING.STG_PEMS_META_FILES   SET DIRECTORY = ( ENABLE = TRUE );
+ALTER STAGE TRAFFIC_PEMS_DB.STAGING.STG_PEMS_FILES        REFRESH;
+ALTER STAGE TRAFFIC_PEMS_DB.STAGING.STG_PEMS_META_FILES   REFRESH;
 
 -- 4) Share access with SYSADMIN (worksheets often default to SYSADMIN)
 GRANT USAGE ON DATABASE TRAFFIC_PEMS_DB TO ROLE SYSADMIN;
